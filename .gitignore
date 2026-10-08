@@ -1,0 +1,16 @@
+/build/
+/cmake-build-*/
+/.cache/
+*.o
+*.gcm
+*.modmap
+*.ddi
+*.ddi.d
+.env
+.env.*
+!.env.example
+.pgpass
+*.pem
+*.key
+*.crt
+*.log
