@@ -15,6 +15,7 @@ module;
 #include <unordered_set>
 #include <utility>
 #include <vector>
+#include <mutex>
 
 module ageof.repository;
 
@@ -184,6 +185,14 @@ Json players(pqxx::transaction_base& tx) {
 
 struct Repository::Impl {
   std::string connectionInfo;
+  mutable std::mutex cacheMutex;
+
+  struct CacheEntry {
+    std::chrono::steady_clock::time_point expiresAt;
+    Json payload;
+  };
+
+  mutable std::unordered_map<std::string, CacheEntry> cache;
 
   pqxx::connection& connection() const {
     thread_local std::string threadConninfo;
@@ -193,6 +202,34 @@ struct Repository::Impl {
       threadConninfo = connectionInfo;
     }
     return *threadConnection;
+  }
+
+  Json cachedJson(std::string_view key, std::chrono::seconds ttl, std::function<Json()> loader) const {
+    const auto now = std::chrono::steady_clock::now();
+    {
+      std::lock_guard<std::mutex> lock(cacheMutex);
+      const auto it = cache.find(std::string(key));
+      if (it != cache.end() && it->second.expiresAt > now) {
+        return it->second.payload;
+      }
+    }
+
+    Json value = loader();
+    {
+      std::lock_guard<std::mutex> lock(cacheMutex);
+      cache[std::string(key)] = CacheEntry{now + ttl, value};
+    }
+    return value;
+  }
+
+  void invalidate(std::string_view key) const {
+    std::lock_guard<std::mutex> lock(cacheMutex);
+    cache.erase(std::string(key));
+  }
+
+  void invalidateAll() const {
+    std::lock_guard<std::mutex> lock(cacheMutex);
+    cache.clear();
   }
 };
 
@@ -228,27 +265,87 @@ ApiResponse Repository::dispatch(std::string_view method,
   }
 
   if (method == "GET" && path == "/api/dashboard") {
-    pqxx::read_transaction tx{impl_->connection()};
-    const auto totals = tx.exec(
-        "SELECT count(*) FILTER (WHERE status <> 'completed')::int AS tournaments, "
-        "count(*) FILTER (WHERE status = 'live')::int AS live "
-      "FROM tournaments").one_row();
-    const auto playerCount = tx.query_value<int>("SELECT count(*)::int FROM players");
-    const auto matchCount = tx.exec(
-        "SELECT count(*) FILTER (WHERE status = 'scheduled')::int AS scheduled, "
-        "count(*) FILTER (WHERE status = 'completed')::int AS completed "
-      "FROM matches").one_row();
-    Json data = Json::object
-        ("counts", Json::object
-            ("tournaments", totals["tournaments"].as<int>())
-            ("live", totals["live"].as<int>())
-            ("players", playerCount)
-            ("scheduledMatches", matchCount["scheduled"].as<int>())
-            ("completedMatches", matchCount["completed"].as<int>()))
-        ("tournaments", tournaments(tx))
-        ("matches", matches(tx))
-        ("players", players(tx));
-    tx.commit();
+    const auto data = impl_->cachedJson("dashboard", std::chrono::seconds{8}, [this]() -> Json {
+      pqxx::read_transaction tx{impl_->connection()};
+      const auto totals = tx.exec(
+          "SELECT count(*) FILTER (WHERE status <> 'completed')::int AS tournaments, "
+          "count(*) FILTER (WHERE status = 'live')::int AS live "
+        "FROM tournaments").one_row();
+      const auto playerCount = tx.query_value<int>("SELECT count(*)::int FROM players");
+      const auto matchCount = tx.exec(
+          "SELECT count(*) FILTER (WHERE status = 'scheduled')::int AS scheduled, "
+          "count(*) FILTER (WHERE status = 'completed')::int AS completed "
+        "FROM matches").one_row();
+      const auto summary = tx.exec(
+          "SELECT count(*) FILTER (WHERE status = 'registration')::int AS registrations_open, "
+          "count(*) FILTER (WHERE status = 'upcoming')::int AS upcoming_events "
+          "FROM tournaments").one_row();
+      const auto performance = tx.exec(
+          "WITH player_performance AS ("
+          "  SELECT p.id, p.elo, "
+          "         COUNT(*) FILTER (WHERE mp.placement = 1) AS wins, "
+          "         COUNT(*) AS games "
+          "  FROM players p "
+          "  LEFT JOIN match_players mp ON mp.player_id = p.id "
+          "  LEFT JOIN matches m ON m.id = mp.match_id AND m.status = 'completed' "
+          "  GROUP BY p.id, p.elo) "
+          "SELECT AVG(100.0 * wins / NULLIF(games, 0))::float8 AS average_win_rate, "
+          "       MAX(elo) - MIN(elo) AS elo_spread, "
+          "       MAX(elo) AS peak_elo "
+          "FROM player_performance").one_row();
+      const auto topPlayers = tx.exec(
+          "SELECT p.id, p.handle, p.country, p.civilization, p.elo "
+          "FROM players p ORDER BY p.elo DESC LIMIT 5");
+      const auto topMaps = tx.exec(
+          "SELECT g.map_name AS map_name, count(*)::int AS games "
+          "FROM match_games g JOIN matches m ON m.id = g.match_id "
+          "WHERE m.status = 'completed' GROUP BY g.map_name ORDER BY games DESC LIMIT 5");
+      const auto topCivilizations = tx.exec(
+          "SELECT civilization, count(*)::int AS players "
+          "FROM players WHERE civilization IS NOT NULL AND civilization <> '' "
+          "GROUP BY civilization ORDER BY players DESC, civilization LIMIT 4");
+      Json result = Json::object
+          ("counts", Json::object
+              ("tournaments", totals["tournaments"].as<int>())
+              ("live", totals["live"].as<int>())
+              ("players", playerCount)
+              ("scheduledMatches", matchCount["scheduled"].as<int>())
+              ("completedMatches", matchCount["completed"].as<int>()))
+          ("summary", Json::object
+              ("averageWinRate", performance["average_win_rate"].is_null() ? 0.0 : performance["average_win_rate"].as<double>())
+              ("eloSpread", performance["elo_spread"].is_null() ? 0 : performance["elo_spread"].as<int>())
+              ("peakElo", performance["peak_elo"].is_null() ? 0 : performance["peak_elo"].as<int>())
+              ("registrationsOpen", summary["registrations_open"].as<int>())
+              ("upcomingEvents", summary["upcoming_events"].as<int>()))
+          ("insights", Json::object
+              ("topPlayers", Json::array)
+              ("topMaps", Json::array)
+              ("topCivilizations", Json::array))
+          ("tournaments", tournaments(tx))
+          ("matches", matches(tx))
+          ("players", players(tx));
+
+      for (const auto& row : topPlayers) {
+        result["insights"]["topPlayers"].push_back(Json::object
+            ("id", row["id"].as<std::int64_t>())
+            ("handle", row["handle"].as<std::string>())
+            ("country", row["country"].as<std::string>())
+            ("civilization", row["civilization"].as<std::string>())
+            ("elo", row["elo"].as<int>()));
+      }
+      for (const auto& row : topMaps) {
+        result["insights"]["topMaps"].push_back(Json::object
+            ("mapName", row["map_name"].as<std::string>())
+            ("games", row["games"].as<int>()));
+      }
+      for (const auto& row : topCivilizations) {
+        result["insights"]["topCivilizations"].push_back(Json::object
+            ("civilization", row["civilization"].as<std::string>())
+            ("players", row["players"].as<int>()));
+      }
+      tx.commit();
+      return result;
+    });
     return response(200, std::move(data));
   }
 
@@ -416,60 +513,63 @@ ApiResponse Repository::dispatch(std::string_view method,
   }
 
   if (method == "GET" && path == "/api/analytics") {
-    pqxx::read_transaction tx{impl_->connection()};
-    Json civilizations = Json::array;
-    for (const auto& row : tx.exec(
-             "SELECT gp.civilization, count(*)::int AS games, "
-             "count(*) FILTER (WHERE gp.placement = 1)::int AS wins, "
-             "round(100.0 * count(*) FILTER (WHERE gp.placement = 1) / count(*), 1)::float8 AS win_rate "
-             "FROM match_game_players gp JOIN match_games g ON g.id = gp.game_id "
-             "JOIN matches m ON m.id = g.match_id WHERE m.status = 'completed' "
-             "GROUP BY gp.civilization ORDER BY win_rate DESC, games DESC, gp.civilization")) {
-      civilizations.push_back(Json::object
-          ("civilization", row["civilization"].as<std::string>())
-          ("games", row["games"].as<int>())
-          ("wins", row["wins"].as<int>())
-          ("winRate", row["win_rate"].as<double>()));
-    }
+    const auto data = impl_->cachedJson("analytics", std::chrono::seconds{15}, [this]() -> Json {
+      pqxx::read_transaction tx{impl_->connection()};
+      Json civilizations = Json::array;
+      for (const auto& row : tx.exec(
+               "SELECT gp.civilization, count(*)::int AS games, "
+               "count(*) FILTER (WHERE gp.placement = 1)::int AS wins, "
+               "round(100.0 * count(*) FILTER (WHERE gp.placement = 1) / count(*), 1)::float8 AS win_rate "
+               "FROM match_game_players gp JOIN match_games g ON g.id = gp.game_id "
+               "JOIN matches m ON m.id = g.match_id WHERE m.status = 'completed' "
+               "GROUP BY gp.civilization ORDER BY win_rate DESC, games DESC, gp.civilization")) {
+        civilizations.push_back(Json::object
+            ("civilization", row["civilization"].as<std::string>())
+            ("games", row["games"].as<int>())
+            ("wins", row["wins"].as<int>())
+            ("winRate", row["win_rate"].as<double>()));
+      }
 
-    Json maps = Json::array;
-    for (const auto& row : tx.exec(
-             "SELECT g.map_name, gp.civilization, count(*)::int AS games, "
-             "count(*) FILTER (WHERE gp.placement = 1)::int AS wins, "
-             "round(100.0 * count(*) FILTER (WHERE gp.placement = 1) / count(*), 1)::float8 AS win_rate "
-             "FROM match_game_players gp JOIN match_games g ON g.id = gp.game_id "
-             "JOIN matches m ON m.id = g.match_id WHERE m.status = 'completed' "
-             "GROUP BY g.map_name, gp.civilization ORDER BY g.map_name, win_rate DESC, games DESC")) {
-      maps.push_back(Json::object
-          ("mapName", row["map_name"].as<std::string>())
-          ("civilization", row["civilization"].as<std::string>())
-          ("games", row["games"].as<int>())
-          ("wins", row["wins"].as<int>())
-          ("winRate", row["win_rate"].as<double>()));
-    }
+      Json maps = Json::array;
+      for (const auto& row : tx.exec(
+               "SELECT g.map_name, gp.civilization, count(*)::int AS games, "
+               "count(*) FILTER (WHERE gp.placement = 1)::int AS wins, "
+               "round(100.0 * count(*) FILTER (WHERE gp.placement = 1) / count(*), 1)::float8 AS win_rate "
+               "FROM match_game_players gp JOIN match_games g ON g.id = gp.game_id "
+               "JOIN matches m ON m.id = g.match_id WHERE m.status = 'completed' "
+               "GROUP BY g.map_name, gp.civilization ORDER BY g.map_name, win_rate DESC, games DESC")) {
+        maps.push_back(Json::object
+            ("mapName", row["map_name"].as<std::string>())
+            ("civilization", row["civilization"].as<std::string>())
+            ("games", row["games"].as<int>())
+            ("wins", row["wins"].as<int>())
+            ("winRate", row["win_rate"].as<double>()));
+      }
 
-    Json matchups = Json::array;
-    for (const auto& row : tx.exec(
-             "SELECT a.civilization, b.civilization AS opponent_civilization, count(*)::int AS games, "
-             "count(*) FILTER (WHERE a.placement < b.placement)::int AS wins, "
-             "count(*) FILTER (WHERE a.placement > b.placement)::int AS losses, "
-             "count(*) FILTER (WHERE a.placement = b.placement)::int AS draws "
-             "FROM match_game_players a JOIN match_game_players b "
-             "ON b.game_id = a.game_id AND b.player_id <> a.player_id "
-             "JOIN match_games g ON g.id = a.game_id JOIN matches m ON m.id = g.match_id "
-             "WHERE m.status = 'completed' AND a.civilization <> b.civilization "
-             "GROUP BY a.civilization, b.civilization ORDER BY games DESC, a.civilization, b.civilization")) {
-      matchups.push_back(Json::object
-          ("civilization", row["civilization"].as<std::string>())
-          ("opponentCivilization", row["opponent_civilization"].as<std::string>())
-          ("games", row["games"].as<int>())
-          ("wins", row["wins"].as<int>())
-          ("losses", row["losses"].as<int>())
-          ("draws", row["draws"].as<int>()));
-    }
-    tx.commit();
-    return response(200, Json::object("civilizations", std::move(civilizations))
-        ("maps", std::move(maps))("matchups", std::move(matchups)));
+      Json matchups = Json::array;
+      for (const auto& row : tx.exec(
+               "SELECT a.civilization, b.civilization AS opponent_civilization, count(*)::int AS games, "
+               "count(*) FILTER (WHERE a.placement < b.placement)::int AS wins, "
+               "count(*) FILTER (WHERE a.placement > b.placement)::int AS losses, "
+               "count(*) FILTER (WHERE a.placement = b.placement)::int AS draws "
+               "FROM match_game_players a JOIN match_game_players b "
+               "ON b.game_id = a.game_id AND b.player_id <> a.player_id "
+               "JOIN match_games g ON g.id = a.game_id JOIN matches m ON m.id = g.match_id "
+               "WHERE m.status = 'completed' AND a.civilization <> b.civilization "
+               "GROUP BY a.civilization, b.civilization ORDER BY games DESC, a.civilization, b.civilization")) {
+        matchups.push_back(Json::object
+            ("civilization", row["civilization"].as<std::string>())
+            ("opponentCivilization", row["opponent_civilization"].as<std::string>())
+            ("games", row["games"].as<int>())
+            ("wins", row["wins"].as<int>())
+            ("losses", row["losses"].as<int>())
+            ("draws", row["draws"].as<int>()));
+      }
+      tx.commit();
+      return Json::object("civilizations", std::move(civilizations))
+          ("maps", std::move(maps))("matchups", std::move(matchups));
+    });
+    return response(200, std::move(data));
   }
 
   if (method == "POST" && path == "/api/tournaments") {
@@ -494,6 +594,7 @@ ApiResponse Repository::dispatch(std::string_view method,
         "VALUES ($1, $2, 'registration', $3, $4::timestamptz, $5, NULLIF($6, 0), $7, $8) RETURNING id",
       pqxx::params{slug, name, format, startsAt, prizeCents, maxPlayers, description, rated}).one_row();
     const auto id = row["id"].as<std::int64_t>();
+    impl_->invalidateAll();
     tx.commit();
     return response(201, Json::object("id", id)("slug", slug)("name", name));
   }
@@ -546,6 +647,7 @@ ApiResponse Repository::dispatch(std::string_view method,
         "ON CONFLICT (tournament_id, player_id) DO UPDATE SET status = 'confirmed' "
         "RETURNING tournament_id, player_id",
       pqxx::params{tournamentId, playerId}).one_row();
+    impl_->invalidateAll();
     tx.commit();
     return response(201, Json::object("tournamentId", row["tournament_id"].as<std::int64_t>())
       ("playerId", row["player_id"].as<std::int64_t>())("handle", handle));
@@ -599,6 +701,7 @@ ApiResponse Repository::dispatch(std::string_view method,
         throw std::invalid_argument("Every match player must be registered in the tournament");
       }
     }
+    impl_->invalidateAll();
     tx.commit();
     return response(201, Json::object("id", matchId)("mapName", mapName)("participants", static_cast<int>(playerIds.size())));
   }
@@ -762,6 +865,7 @@ ApiResponse Repository::dispatch(std::string_view method,
         "AND EXISTS (SELECT 1 FROM matches WHERE tournament_id = $1) "
         "AND NOT EXISTS (SELECT 1 FROM matches WHERE tournament_id = $1 AND status <> 'completed')",
       pqxx::params{tournamentId});
+    impl_->invalidateAll();
     tx.commit();
     Json updatedParticipants = Json::array;
     for (const auto& participant : participants) {

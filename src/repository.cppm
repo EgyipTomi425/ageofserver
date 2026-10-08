@@ -1,9 +1,13 @@
 module;
 
+#include <chrono>
 #include <cstdint>
+#include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 
 export module ageof.repository;
 
