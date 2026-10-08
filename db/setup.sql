@@ -112,7 +112,15 @@ VALUES
     ('Copperfield', 'PL', 'Polish', 1542),
     ('Lynx', 'FI', 'Inca', 1511),
     ('Mistral', 'ES', 'Spanish', 1484),
-    ('Orchid', 'BR', 'Japanese', 1455)
+    ('Orchid', 'BR', 'Japanese', 1455),
+    ('EmberVale', 'AU', 'Mongols', 1438),
+    ('NightHarbor', 'KR', 'Koreans', 1412),
+    ('Stoneglass', 'NO', 'Russians', 1389),
+    ('Frostline', 'RU', 'Ottomans', 1376),
+    ('SignalFox', 'JP', 'Japanese', 1348),
+    ('Quartz', 'IT', 'Italians', 1327),
+    ('Morrow', 'CZ', 'Spanish', 1305),
+    ('Riverbound', 'CN', 'Chinese', 1289)
 ON CONFLICT (handle) DO NOTHING;
 
 INSERT INTO tournament_entries (tournament_id, player_id, seed, status)
@@ -130,6 +138,14 @@ FROM (VALUES
     ('frontier-open-2026', 'Lynx', 2, 'confirmed'),
     ('frontier-open-2026', 'Mistral', 3, 'confirmed'),
     ('frontier-open-2026', 'Orchid', 4, 'confirmed'),
+    ('frontier-open-2026', 'EmberVale', 5, 'confirmed'),
+    ('frontier-open-2026', 'NightHarbor', 6, 'confirmed'),
+    ('frontier-open-2026', 'Stoneglass', 7, 'confirmed'),
+    ('frontier-open-2026', 'Frostline', 8, 'confirmed'),
+    ('frontier-open-2026', 'SignalFox', 9, 'confirmed'),
+    ('frontier-open-2026', 'Quartz', 10, 'confirmed'),
+    ('frontier-open-2026', 'Morrow', 11, 'confirmed'),
+    ('frontier-open-2026', 'Riverbound', 12, 'confirmed'),
     ('autumn-league-finals-2026', 'MapleFox', 1, 'champion'),
     ('autumn-league-finals-2026', 'BlueComet', 2, 'confirmed'),
     ('autumn-league-finals-2026', 'Rook', 3, 'confirmed'),
